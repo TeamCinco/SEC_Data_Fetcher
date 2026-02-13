@@ -1,4 +1,5 @@
-import requests
+import asyncio
+import aiohttp
 import pandas as pd
 from time import sleep
 import signal
@@ -7,12 +8,12 @@ import atexit
 
 # SEC requires a User-Agent header
 headers = {
-    'User-Agent': 'Humberto Renderos humberto.jobs24@gmail.com'
+    'User-Agent': 'Humberto Renderos humberto.jobs24@example.com'
 }
 
 # Global list to store results for graceful shutdown
 results = []
-output_path = '/Users/jazzhashzzz/Documents/Market_Analysis_files/output/sec/sec_filing_urls.csv'
+output_path = '/Users/jazzhashzzz/Desktop/SEC_Data_Fetcher/output/sec_filing_urls.csv'
 
 def save_results():
     """Save current results to CSV"""
@@ -37,16 +38,27 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTSTP, signal_handler)
 atexit.register(save_results)
 
-def get_all_filings_fast(cik, filing_type='10-K'):
-    """Get ALL filings - just build the URLs, don't check if they exist"""
+async def fetch_json(session, url):
+    """Async fetch JSON from URL"""
+    try:
+        async with session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
+async def get_all_filings_async(session, ticker, cik, filing_type='10-K'):
+    """Get ALL filings for a ticker asynchronously"""
     cik_padded = str(cik).zfill(10)
     
     try:
         # Get company filings
         url = f'https://data.sec.gov/submissions/CIK{cik_padded}.json'
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        data = await fetch_json(session, url)
+        
+        if not data:
+            return []
         
         found_filings = []
         
@@ -63,6 +75,8 @@ def get_all_filings_fast(cik, filing_type='10-K'):
                 filing_url = f'https://www.sec.gov/Archives/edgar/data/{cik}/{accession_clean}/{primary_document}'
                 
                 found_filings.append({
+                    'ticker': ticker.upper(),
+                    'cik': cik,
                     'filing_type': filing_type,
                     'accession_number': accession_no,
                     'filing_date': filing_date,
@@ -73,13 +87,15 @@ def get_all_filings_fast(cik, filing_type='10-K'):
         
         # Older filings
         if 'files' in data['filings']:
+            old_file_tasks = []
             for file_info in data['filings']['files']:
                 file_url = f"https://data.sec.gov/submissions/{file_info['name']}"
-                try:
-                    file_response = requests.get(file_url, headers=headers)
-                    file_response.raise_for_status()
-                    old_data = file_response.json()
-                    
+                old_file_tasks.append(fetch_json(session, file_url))
+            
+            old_files_data = await asyncio.gather(*old_file_tasks, return_exceptions=True)
+            
+            for old_data in old_files_data:
+                if old_data and not isinstance(old_data, Exception):
                     for i, form in enumerate(old_data['form']):
                         if form == filing_type:
                             accession_no = old_data['accessionNumber'][i]
@@ -91,6 +107,8 @@ def get_all_filings_fast(cik, filing_type='10-K'):
                             filing_url = f'https://www.sec.gov/Archives/edgar/data/{cik}/{accession_clean}/{primary_document}'
                             
                             found_filings.append({
+                                'ticker': ticker.upper(),
+                                'cik': cik,
                                 'filing_type': filing_type,
                                 'accession_number': accession_no,
                                 'filing_date': filing_date,
@@ -98,65 +116,84 @@ def get_all_filings_fast(cik, filing_type='10-K'):
                                 'filing_url': filing_url,
                                 'status': 'found'
                             })
-                    
-                except Exception as e:
-                    print(f"    Error fetching old filings: {e}")
         
-        print(f'    Found {len(found_filings)} {filing_type} filings')
-        return found_filings if found_filings else [{'filing_type': filing_type, 'status': 'no_filings_found'}]
+        print(f'✓ {ticker.upper()}: Found {len(found_filings)} {filing_type} filings')
+        return found_filings
     
     except Exception as e:
-        return [{'filing_type': filing_type, 'status': f'error: {str(e)}'}]
+        print(f'✗ {ticker.upper()}: Error - {e}')
+        return []
 
-# Read ticker file
-ticker_file_path = '/Users/jazzhashzzz/Documents/Market_Analysis_files/ticker.txt'
-
-tickers = {}
-with open(ticker_file_path, 'r') as f:
-    for line in f:
-        line = line.strip()
-        if line:
-            ticker, cik = line.split('\t')
-            tickers[ticker] = int(cik)
-
-# Filing types to fetch
-filing_types = ['10-K', '10-Q']
-
-# Get filings for each ticker
-try:
-    for ticker, cik in tickers.items():
-        print(f'Processing {ticker.upper()}... (CIK: {cik})', end=' ')
+async def process_all_tickers(tickers, filing_types):
+    """Process all tickers concurrently"""
+    # SEC rate limit: ~10 requests per second
+    connector = aiohttp.TCPConnector(limit=3)  # Max 3 concurrent connections
+    timeout = aiohttp.ClientTimeout(total=30)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        tasks = []
         
-        for filing_type in filing_types:
-            filing_list = get_all_filings_fast(cik, filing_type)
+        for ticker, cik in tickers.items():
+            for filing_type in filing_types:
+                tasks.append(get_all_filings_async(session, ticker, cik, filing_type))
+        
+        # Process in small batches to respect rate limits
+        batch_size = 5
+        for i in range(0, len(tasks), batch_size):
+            batch = tasks[i:i+batch_size]
+            batch_results = await asyncio.gather(*batch, return_exceptions=True)
             
-            for filing_info in filing_list:
-                results.append({
-                    'ticker': ticker.upper(),
-                    'cik': cik,
-                    **filing_info
-                })
-        
-        sleep(0.15)  # Just rate limit the API calls
+            for result in batch_results:
+                if result and not isinstance(result, Exception):
+                    results.extend(result)
+            
+            # Longer delay between batches (SEC allows ~10 req/sec)
+            if i + batch_size < len(tasks):
+                print(f"  Progress: {i+batch_size}/{len(tasks)} tasks completed...")
+                await asyncio.sleep(1.0)  # 1 second between batches
 
-except KeyboardInterrupt:
-    print("\n\n⚠️  Interrupted by user! Saving progress...")
+async def main():
+    # Read ticker file
+    ticker_file_path = '/Users/jazzhashzzz/Documents/Market_Analysis_files/ticker.txt'
+    
+    tickers = {}
+    with open(ticker_file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                ticker, cik = line.split('\t')
+                tickers[ticker] = int(cik)
+    
+    print(f"Processing {len(tickers)} tickers...")
+    
+    # Filing types to fetch
+    filing_types = ['10-K', '10-Q']
+    
+    # Process all tickers
+    await process_all_tickers(tickers, filing_types)
+    
+    # Save results
     save_results()
-    sys.exit(0)
+    
+    # Display summary
+    if results:
+        df = pd.DataFrame(results)
+        successful = df[df['status'] == 'found'].copy()
+        
+        print("\n" + "="*80)
+        print(f"TOTAL RESULTS: {len(successful)} filings found")
+        print("="*80)
+        
+        summary = successful.groupby(['ticker', 'filing_type']).size().reset_index(name='count')
+        print("\nBreakdown by ticker and filing type:")
+        print(summary.to_string(index=False))
+        
+        print(f"\nSaved to: {output_path}")
 
-# Save final results
-save_results()
-
-# Display summary
-df = pd.DataFrame(results)
-successful = df[df['status'] == 'found'].copy()
-
-print("\n" + "="*80)
-print(f"TOTAL RESULTS: {len(successful)} filings found")
-print("="*80)
-
-summary = successful.groupby(['ticker', 'filing_type']).size().reset_index(name='count')
-print("\nBreakdown by ticker and filing type:")
-print(summary.to_string(index=False))
-
-print(f"\nSaved to: {output_path}")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user! Saving progress...")
+        save_results()
+        sys.exit(0)

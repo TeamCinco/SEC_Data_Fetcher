@@ -8,7 +8,7 @@ import atexit
 
 # SEC requires a User-Agent header
 headers = {
-    'User-Agent': 'Humberto Renderos humberto.jobs24@example.com'
+    'User-Agent': 'Goon Deer Goon.goon@example.com'
 }
 
 # Global list to store results for graceful shutdown
@@ -153,16 +153,19 @@ async def process_all_tickers(tickers, filing_types):
                 await asyncio.sleep(1.0)  # 1 second between batches
 
 async def main():
-    # Read ticker file
-    ticker_file_path = '/Users/jazzhashzzz/Documents/Market_Analysis_files/ticker.txt'
+    # Read ticker file (JSON format)
+    ticker_file_path = '/Users/jazzhashzzz/Desktop/SEC_DATA_FETCHER/ticker.json'
     
-    tickers = {}
+    import json
     with open(ticker_file_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                ticker, cik = line.split('\t')
-                tickers[ticker] = int(cik)
+        ticker_data = json.load(f)
+    
+    # Convert to dict: {ticker: cik}
+    tickers = {}
+    for key, value in ticker_data.items():
+        ticker = value['ticker']
+        cik = value['cik_str']
+        tickers[ticker] = cik
     
     print(f"Processing {len(tickers)} tickers...")
     

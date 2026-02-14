@@ -1,66 +1,50 @@
-# SEC Filing Downloader
+# 📊 SEC Real-Time Filing-to-Excel Converter
 
-A Streamlit web app for downloading SEC 10-K and 10-Q filings with direct Excel access.
+### "Because waiting for the SEC to generate an Excel file shouldn't be part of your workflow."
 
-## Quick Start
+## 📌 What is this?
 
-### Local Development
+When a company (like PayPal or Apple) submits a new financial filing (10-K or 10-Q), the SEC website provides the **PDF** and **HTML** versions immediately. However, it often takes **hours or even days** for the official "Interactive Data" Excel file to appear on the EDGAR system.
 
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+**This tool bridges that gap.** It takes the raw HTML filing and instantly converts it into a structured Excel workbook that looks exactly like the one the SEC eventually provides.
 
-2. Make sure your `sec_filing_urls.csv` is in the same directory
+---
 
-3. Run the app:
-```bash
-streamlit run streamlit_app.py
-```
+## 🚀 Why use this?
 
-## Deploy to Streamlit Community Cloud (FREE)
+* **Zero Wait Time:** Get your data the second the filing hits the wire.
+* **Dynamic Extraction:** No hardcoded lists. Whether it's a tech company or a bank, the tool finds the specific tables (Balance Sheet, Income Statement, etc.) automatically.
+* **iXBRL Powered:** It doesn't just "read" text; it pulls the hidden digital tags (XBRL) embedded by the company’s accountants. This means the numbers are 100% accurate.
+* **No "Messy" Sheets:** Unlike a standard PDF-to-Excel converter that creates a mess of merged cells, this creates clean, analysis-ready rows and columns.
 
-1. Push this code to GitHub:
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
-```
+---
 
-2. Go to https://share.streamlit.io
+## 🛠️ How it works (The Simple Version)
 
-3. Click "New app"
+1. **The Input:** You give it a link or a downloaded `.html` filing from the SEC EDGAR website.
+2. **The Search:** The tool scans the document for "Smart Tags" (iXBRL) that identify specific financial metrics (e.g., *Net Income*, *Total Assets*).
+3. **The Build:** It groups these tags into their respective categories:
+* **Balance Sheet**
+* **Income Statement**
+* **Cash Flows**
+* **Stockholders' Equity**
 
-4. Select your repository, branch (main), and main file path (streamlit_app.py)
 
-5. Click "Deploy"
+4. **The Output:** It saves everything into a multi-sheet `.xlsx` file formatted for financial modeling.
 
-Done! Your app will be live at: `https://YOUR_APP_NAME.streamlit.app`
+---
 
-## File Structure
+## 📂 Project Structure
 
-```
-.
-├── streamlit_app.py          # Main Streamlit app
-├── requirements.txt           # Python dependencies
-├── sec_filing_urls.csv        # Your SEC filing database (generated from your script)
-└── README.md                  # This file
-```
+* `ixbrl_to_excel.py`: The "Smart" engine that reads digital tags.
+* `dynamic_xbrl_extractor.py`: The "Flexible" engine that handles different company naming conventions automatically.
+* `examples/`: Contains the converted PayPal 2025 filings as a proof of concept.
 
-## Features
+---
 
-- Search by ticker symbol
-- Filter by filing type (10-K, 10-Q, or All)
-- Direct download links for:
-  - Excel files (Financial_Report.xlsx)
-  - HTML filing viewer
-  - Raw TXT format
-- Database statistics in sidebar
-- Clean, responsive UI
+## 🏁 Quick Start
 
-## Data Source
+1. Download your desired `.html` filing from the SEC.
+2. Run the script.
+3. Open your brand-new Excel file.
 
-All data comes from SEC EDGAR database via their public API.

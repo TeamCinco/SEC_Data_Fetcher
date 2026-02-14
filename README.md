@@ -1,50 +1,40 @@
-# 📊 SEC Real-Time Filing-to-Excel Converter
+# 📊 SEC Filing Downloader & Financial Parser
 
-### "Because waiting for the SEC to generate an Excel file shouldn't be part of your workflow."
+A real-time tool to download SEC filings (10-K/10-Q) and instantly convert them into structured Excel files—even when the official SEC Excel version isn't available yet.
 
-## 📌 What is this?
+## 🚀 Purpose
 
-When a company (like PayPal or Apple) submits a new financial filing (10-K or 10-Q), the SEC website provides the **PDF** and **HTML** versions immediately. However, it often takes **hours or even days** for the official "Interactive Data" Excel file to appear on the EDGAR system.
+When a company files a report, the SEC takes time to generate an "Interactive Data" Excel file. This project skips the wait by parsing the **Inline XBRL (iXBRL)** directly from the HTML filing to create a clean, multi-sheet Excel workbook for immediate analysis.
 
-**This tool bridges that gap.** It takes the raw HTML filing and instantly converts it into a structured Excel workbook that looks exactly like the one the SEC eventually provides.
+## ✨ Key Features
 
----
-
-## 🚀 Why use this?
-
-* **Zero Wait Time:** Get your data the second the filing hits the wire.
-* **Dynamic Extraction:** No hardcoded lists. Whether it's a tech company or a bank, the tool finds the specific tables (Balance Sheet, Income Statement, etc.) automatically.
-* **iXBRL Powered:** It doesn't just "read" text; it pulls the hidden digital tags (XBRL) embedded by the company’s accountants. This means the numbers are 100% accurate.
-* **No "Messy" Sheets:** Unlike a standard PDF-to-Excel converter that creates a mess of merged cells, this creates clean, analysis-ready rows and columns.
-
----
-
-## 🛠️ How it works (The Simple Version)
-
-1. **The Input:** You give it a link or a downloaded `.html` filing from the SEC EDGAR website.
-2. **The Search:** The tool scans the document for "Smart Tags" (iXBRL) that identify specific financial metrics (e.g., *Net Income*, *Total Assets*).
-3. **The Build:** It groups these tags into their respective categories:
-* **Balance Sheet**
-* **Income Statement**
-* **Cash Flows**
-* **Stockholders' Equity**
-
-
-4. **The Output:** It saves everything into a multi-sheet `.xlsx` file formatted for financial modeling.
-
----
+* **Direct Downloads**: Fetches 10-K and 10-Q filings directly from the SEC EDGAR API.
+* **Smart Parsing**: Dynamically extracts financial statements (Balance Sheet, Income, Cash Flow) without needing hardcoded labels.
+* **Stock Insights**: Displays real-time market data, valuation ratios (P/E, P/S), and profitability metrics for the searched ticker.
+* **User-Friendly Dashboard**: Built with Streamlit for a clean, searchable interface.
 
 ## 📂 Project Structure
 
-* `ixbrl_to_excel.py`: The "Smart" engine that reads digital tags.
-* `dynamic_xbrl_extractor.py`: The "Flexible" engine that handles different company naming conventions automatically.
-* `examples/`: Contains the converted PayPal 2025 filings as a proof of concept.
+* `streamlit_app.py`: The main entry point and web dashboard.
+* `xbrl_parser.py`: The engine that turns raw HTML/XBRL into Excel.
+* `data_loader.py`: Handles all API calls to the SEC.
+* `stock_data.py`: Fetches real-time market metrics from Yahoo Finance.
+* `ui_components.py`: Houses the visual elements for the dashboard.
 
----
+## 🛠️ Quick Start
 
-## 🏁 Quick Start
+1. **Install dependencies**:
+```bash
+pip install streamlit pandas openpyxl beautifulsoup4 requests yfinance
 
-1. Download your desired `.html` filing from the SEC.
-2. Run the script.
-3. Open your brand-new Excel file.
+```
 
+
+2. **Run the app**:
+```bash
+streamlit run streamlit_app.py
+
+```
+
+
+3. **Search for a ticker**: Enter symbols like `AAPL`, `PYPL`, or `TSLA` to find and download their latest filings.

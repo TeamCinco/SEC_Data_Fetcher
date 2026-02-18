@@ -1,311 +1,301 @@
-"""
-RELATIONAL iXBRL PARSER — FILTERED FINANCIAL STATEMENTS
-- Proper XML parsing
-- Safe Excel sheet names
-- Full context + dimension support
-- ONLY exports:
-    • Income Statement
-    • Balance Sheet
-    • Cash Flow
-    • Stockholders Equity
-"""
-
 import re
 import requests
 import tempfile
 from pathlib import Path
+from datetime import datetime
 from collections import defaultdict
-import pandas as pd
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
 
-class RelationalXBRLParser:
+class BulletProofConsolidatedParser:
 
-    INVALID_SHEET_CHARS = r'[:\\/?*\[\]]'
+    TARGET_HEADINGS = [
+        "consolidated balance sheets",
+        "consolidated statements of operations",
+        "consolidated statements of comprehensive",
+        "consolidated statements of cash flows",
+        "consolidated statements of shareholders",
+        "consolidated statements of stockholders"
+    ]
 
-    TARGET_SHEETS = {
-        "income": "Income Statement",
-        "revenue": "Income Statement",
-        "expense": "Income Statement",
-        "profit": "Income Statement",
-
-        "asset": "Balance Sheet",
-        "liabilit": "Balance Sheet",
-        "equity": "Stockholders Equity",
-
-        "cash": "Cash Flow",
-        "operating activities": "Cash Flow",
-        "investing activities": "Cash Flow",
-        "financing activities": "Cash Flow",
-    }
-
-    def __init__(self, html_file: str, output_file: str = None):
+    def __init__(self, html_file, output_file):
         self.html_file = Path(html_file)
-        self.output_file = Path(output_file) if output_file else self.html_file.with_suffix(".xlsx")
-
+        self.output_file = Path(output_file)
         self.soup = None
-        self.contexts = {}
-        self.units = {}
-        self.facts = []
+        self.context_map = {}
+        self.valid_year_ends = set()
 
     # ---------------------------------------------------------
-    # LOAD (XML MODE)
+    # LOAD AS XML (CRITICAL)
     # ---------------------------------------------------------
 
-    def parse_html(self):
+    def load(self):
         with open(self.html_file, "r", encoding="utf-8", errors="ignore") as f:
-            self.soup = BeautifulSoup(f.read(), "lxml-xml")
+            self.soup = BeautifulSoup(f.read(), "xml")
 
     # ---------------------------------------------------------
-    # CONTEXTS
+    # BUILD CONTEXT MAP (NO SEGMENTS)
     # ---------------------------------------------------------
 
-    def extract_contexts(self):
+    def build_context_map(self):
 
         for ctx in self.soup.find_all("context"):
+
             ctx_id = ctx.get("id")
             if not ctx_id:
                 continue
 
-            context_data = {
-                "period_type": None,
-                "start": None,
-                "end": None,
-                "instant": None,
-                "dimensions": []
-            }
+            # Skip dimensional contexts
+            if ctx.find("segment"):
+                continue
 
             period = ctx.find("period")
-            if period:
-                if period.find("instant"):
-                    context_data["period_type"] = "instant"
-                    context_data["instant"] = period.find("instant").text.strip()
+            if not period:
+                continue
 
-                elif period.find("startDate") and period.find("endDate"):
-                    context_data["period_type"] = "duration"
-                    context_data["start"] = period.find("startDate").text.strip()
-                    context_data["end"] = period.find("endDate").text.strip()
+            instant = period.find("instant")
+            start = period.find("startDate")
+            end = period.find("endDate")
 
-            segment = ctx.find("segment")
-            if segment:
-                for explicit in segment.find_all("explicitMember"):
-                    dimension = explicit.get("dimension")
-                    member = explicit.text.strip()
-                    context_data["dimensions"].append((dimension, member))
+            data = {"type": None, "start": None, "end": None, "instant": None}
 
-                for typed in segment.find_all("typedMember"):
-                    dimension = typed.get("dimension")
-                    member = typed.get_text(strip=True)
-                    context_data["dimensions"].append((dimension, member))
+            if instant:
+                data["type"] = "instant"
+                data["instant"] = instant.text.strip()
 
-            self.contexts[ctx_id] = context_data
+            elif start and end:
+                data["type"] = "duration"
+                data["start"] = start.text.strip()
+                data["end"] = end.text.strip()
+
+            self.context_map[ctx_id] = data
 
     # ---------------------------------------------------------
-    # UNITS
+    # DETECT VALID FISCAL YEAR-END DATES FROM HEADER
     # ---------------------------------------------------------
 
-    def extract_units(self):
-        for unit in self.soup.find_all("unit"):
-            unit_id = unit.get("id")
-            measure = unit.get_text(strip=True)
-            self.units[unit_id] = measure
+    def detect_year_ends_from_table(self, table):
+
+        dates = set()
+
+        header_text = table.get_text(" ", strip=True)
+
+        # Look for June 27, 2025 etc
+        matches = re.findall(r"[A-Za-z]+\s+\d{1,2},\s+\d{4}", header_text)
+
+        for match in matches:
+            try:
+                dt = datetime.strptime(match, "%B %d, %Y")
+                dates.add(dt.strftime("%Y-%m-%d"))
+            except:
+                continue
+
+        return dates
 
     # ---------------------------------------------------------
-    # FACTS
+    # FILTER FULL YEAR DURATION
     # ---------------------------------------------------------
 
-    def extract_all_facts(self):
+    def is_full_year(self, context):
 
-        for tag in self.soup.find_all("nonFraction"):
-            self.facts.append(self._parse_numeric(tag))
+        if context["type"] != "duration":
+            return False
 
-        for tag in self.soup.find_all("nonNumeric"):
-            self.facts.append(self._parse_text(tag))
+        try:
+            d1 = datetime.fromisoformat(context["start"])
+            d2 = datetime.fromisoformat(context["end"])
+            return (d2 - d1).days > 350
+        except:
+            return False
 
-    def _parse_numeric(self, tag):
+    # ---------------------------------------------------------
+    # FIND CONSOLIDATED TABLES
+    # ---------------------------------------------------------
 
-        text = tag.get_text(strip=True)
+    def find_statement_tables(self):
+
+        tables = []
+
+        headings = self.soup.find_all(
+            lambda tag: tag.name in ["p", "div", "strong", "h1", "h2", "h3"]
+            and tag.get_text(strip=True)
+        )
+
+        for heading in headings:
+
+            text = heading.get_text(strip=True).lower()
+
+            if any(t in text for t in self.TARGET_HEADINGS):
+
+                table = heading.find_next("table")
+
+                if table:
+                    tables.append((heading.get_text(strip=True), table))
+
+        return tables
+
+    # ---------------------------------------------------------
+    # CLEAN NUMERIC TAG
+    # ---------------------------------------------------------
+
+    def parse_numeric(self, tag):
 
         if tag.get("format") == "ixt:fixed-zero":
-            value = 0.0
-        else:
-            text = text.replace(",", "").replace("$", "").strip()
-            if text in ["—", "-", "", None]:
-                return None
-            try:
-                value = float(text)
-            except:
-                return None
+            return 0.0
 
-            scale = int(tag.get("scale", "0"))
-            value *= 10 ** scale
+        text = tag.get_text(strip=True)
+        text = text.replace(",", "").replace("$", "").strip()
 
-            if tag.get("sign") == "-":
-                value = -abs(value)
+        if text in ["—", "-", ""]:
+            return None
 
-        return {
-            "type": "numeric",
-            "name": tag.get("name"),
-            "context": tag.get("contextRef"),
-            "value": value
-        }
+        try:
+            value = float(text)
+        except:
+            return None
 
-    def _parse_text(self, tag):
+        scale = int(tag.get("scale", "0"))
+        value *= 10 ** scale
 
-        return {
-            "type": "text",
-            "name": tag.get("name"),
-            "context": tag.get("contextRef"),
-            "value": tag.get_text(strip=True)
-        }
+        if tag.get("sign") == "-":
+            value = -abs(value)
+
+        return value
 
     # ---------------------------------------------------------
-    # CLASSIFY STATEMENT
+    # PARSE TABLE WITH STRICT FILTERING
     # ---------------------------------------------------------
 
-    def _classify_statement(self, label):
+    def parse_table(self, table):
 
-        label_lower = label.lower()
+        data = defaultdict(dict)
 
-        for key, statement in self.TARGET_SHEETS.items():
-            if key in label_lower:
-                return statement
+        # detect valid fiscal year-ends
+        self.valid_year_ends = self.detect_year_ends_from_table(table)
 
-        return None
+        for row in table.find_all("tr"):
 
-    # ---------------------------------------------------------
-    # BUILD DATAFRAMES
-    # ---------------------------------------------------------
-
-    def build_statement_dataframes(self):
-
-        statements = {
-            "Income Statement": defaultdict(dict),
-            "Balance Sheet": defaultdict(dict),
-            "Cash Flow": defaultdict(dict),
-            "Stockholders Equity": defaultdict(dict)
-        }
-
-        for fact in self.facts:
-
-            if not fact or fact["type"] != "numeric":
+            cells = row.find_all(["td", "th"])
+            if not cells:
                 continue
 
-            context = self.contexts.get(fact["context"])
-            if not context:
+            label = None
+
+            # Extract first meaningful text as label
+            for cell in cells:
+                text = cell.get_text(strip=True)
+                if text and text not in ["$", "—", "-"]:
+                    label = text
+                    break
+
+            if not label:
                 continue
 
-            label = self._humanize(fact["name"])
-            statement_type = self._classify_statement(label)
+            numeric_tags = row.find_all("ix:nonFraction")
 
-            if not statement_type:
+            if not numeric_tags:
                 continue
 
-            period = context["instant"] if context["period_type"] == "instant" else context["end"]
+            for tag in numeric_tags:
 
-            statements[statement_type][label][period] = fact["value"]
+                context_id = tag.get("contextRef")
+                context = self.context_map.get(context_id)
 
-        dfs = {}
-        for name, data in statements.items():
-            df = pd.DataFrame.from_dict(data, orient="index")
-            if not df.empty:
-                dfs[name] = df
+                if not context:
+                    continue
 
-        return dfs
+                # Determine date
+                if context["type"] == "instant":
+                    date = context["instant"]
+                else:
+                    if not self.is_full_year(context):
+                        continue
+                    date = context["end"]
 
-    def _humanize(self, concept):
+                # Only keep dates that appear in header
+                if self.valid_year_ends and date not in self.valid_year_ends:
+                    continue
 
-        if not concept:
-            return "Unknown"
+                value = self.parse_numeric(tag)
+                if value is None:
+                    continue
 
-        if ":" in concept:
-            concept = concept.split(":")[1]
+                data[label][date] = value
 
-        concept = re.sub(r"([A-Z])", r" \1", concept).strip()
-        concept = re.sub(r"\s+", " ", concept)
-
-        return concept
-
-    # ---------------------------------------------------------
-    # SAFE SHEET NAME
-    # ---------------------------------------------------------
-
-    def _safe_sheet_name(self, name, existing):
-
-        name = re.sub(self.INVALID_SHEET_CHARS, "-", name)
-        name = name[:31]
-
-        original = name
-        counter = 1
-
-        while name in existing:
-            name = f"{original[:28]}_{counter}"
-            counter += 1
-
-        return name
+        return data
 
     # ---------------------------------------------------------
-    # EXCEL
+    # WRITE TO EXCEL
     # ---------------------------------------------------------
 
-    def write_to_excel(self):
-
-        statement_dfs = self.build_statement_dataframes()
+    def write_excel(self):
 
         wb = Workbook()
         wb.remove(wb.active)
 
         used_names = set()
 
-        for statement_name, df in statement_dfs.items():
+        for title, table in self.find_statement_tables():
 
-            sheet_name = self._safe_sheet_name(statement_name, used_names)
+            parsed = self.parse_table(table)
+
+            if not parsed:
+                continue
+
+            sheet_name = title[:31]
+            base = sheet_name
+            counter = 1
+
+            while sheet_name in used_names:
+                sheet_name = f"{base[:28]}_{counter}"
+                counter += 1
+
             used_names.add(sheet_name)
 
-            ws = wb.create_sheet(title=sheet_name)
+            ws = wb.create_sheet(sheet_name)
+
+            dates = sorted(
+                {d for row in parsed.values() for d in row.keys()}
+            )
 
             ws.cell(row=1, column=1, value="Line Item").font = Font(bold=True)
 
-            for col_idx, col_name in enumerate(df.columns, start=2):
-                ws.cell(row=1, column=col_idx, value=col_name).font = Font(bold=True)
+            for col, date in enumerate(dates, start=2):
+                ws.cell(row=1, column=col, value=date).font = Font(bold=True)
 
-            for row_idx, (label, row) in enumerate(df.iterrows(), start=2):
-                ws.cell(row=row_idx, column=1, value=label)
+            for r_idx, (label, values) in enumerate(parsed.items(), start=2):
+                ws.cell(row=r_idx, column=1, value=label)
 
-                for col_idx, value in enumerate(row, start=2):
-                    ws.cell(row=row_idx, column=col_idx, value=value).alignment = Alignment(horizontal="right")
+                for c_idx, date in enumerate(dates, start=2):
+                    if date in values:
+                        ws.cell(
+                            row=r_idx,
+                            column=c_idx,
+                            value=values[date]
+                        ).alignment = Alignment(horizontal="right")
 
-            ws.column_dimensions["A"].width = 50
-            for col in range(2, len(df.columns) + 2):
-                ws.column_dimensions[get_column_letter(col)].width = 20
+            ws.column_dimensions["A"].width = 55
+            for col in range(2, len(dates) + 2):
+                ws.column_dimensions[get_column_letter(col)].width = 18
 
         wb.save(self.output_file)
 
     # ---------------------------------------------------------
+    # RUN
+    # ---------------------------------------------------------
 
-    def convert(self):
+    def run(self):
+        self.load()
+        self.build_context_map()
+        self.write_excel()
 
-        self.parse_html()
-        self.extract_contexts()
-        self.extract_units()
-        self.extract_all_facts()
-        self.write_to_excel()
-
-        return self.output_file
-
-
-# ---------------------------------------------------------
-# PUBLIC FUNCTION (STREAMLIT SAFE)
-# ---------------------------------------------------------
 
 def parse_xbrl_to_excel(html_url, output_path):
 
-    headers = {
-        "User-Agent": "Research App contact@example.com"
-    }
+    headers = {"User-Agent": "Research App contact@example.com"}
 
     response = requests.get(html_url, headers=headers, timeout=30)
     response.raise_for_status()
@@ -314,9 +304,9 @@ def parse_xbrl_to_excel(html_url, output_path):
         tmp.write(response.content)
         tmp_path = tmp.name
 
-    parser = RelationalXBRLParser(tmp_path, output_path)
-    result = parser.convert()
+    parser = BulletProofConsolidatedParser(tmp_path, output_path)
+    parser.run()
 
     Path(tmp_path).unlink()
 
-    return result
+    return output_path

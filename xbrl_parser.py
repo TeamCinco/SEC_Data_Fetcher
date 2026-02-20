@@ -1,312 +1,225 @@
-import re
 import requests
-import tempfile
-from pathlib import Path
-from datetime import datetime
-from collections import defaultdict
-from bs4 import BeautifulSoup
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
-from openpyxl.utils import get_column_letter
+import pandas as pd
+import xml.etree.ElementTree as ET
+from io import BytesIO
+
+HEADERS = {
+    "User-Agent": "SEC Filing App contact@example.com"
+}
+
+XBRL_NS = "{http://www.xbrl.org/2003/instance}"
+LINK_NS = "{http://www.xbrl.org/2003/linkbase}"
+XLINK_NS = "{http://www.w3.org/1999/xlink}"
 
 
-class BulletProofConsolidatedParser:
+class SECXBRLParser:
 
-    TARGET_HEADINGS = [
-        "consolidated balance sheets",
-        "consolidated statements of operations",
-        "consolidated statements of comprehensive",
-        "consolidated statements of cash flows",
-        "consolidated statements of shareholders",
-        "consolidated statements of stockholders"
-    ]
+    def extract_ids_from_url(self, filing_url):
+        parts = filing_url.strip("/").split("/")
+        return parts[6], parts[7]
 
-    def __init__(self, html_file, output_file):
-        self.html_file = Path(html_file)
-        self.output_file = Path(output_file)
-        self.soup = None
-        self.context_map = {}
-        self.valid_year_ends = set()
+    def get_filing_index(self, cik, accession):
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/index.json"
+        r = requests.get(url, headers=HEADERS)
+        r.raise_for_status()
+        return r.json()["directory"]["item"]
 
-    # ---------------------------------------------------------
-    # LOAD AS XML (CRITICAL)
-    # ---------------------------------------------------------
-
-    def load(self):
-        with open(self.html_file, "r", encoding="utf-8", errors="ignore") as f:
-            self.soup = BeautifulSoup(f.read(), "xml")
+    def find_file(self, files, suffix):
+        for f in files:
+            if f["name"].lower().endswith(suffix):
+                return f["name"]
+        return None
 
     # ---------------------------------------------------------
-    # BUILD CONTEXT MAP (NO SEGMENTS)
+    # Parse ALL facts with context dates
     # ---------------------------------------------------------
+    def parse_instance(self, cik, accession, files):
+        instance_file = None
 
-    def build_context_map(self):
+        for f in files:
+            if f["name"].lower().endswith(".xml") and "_htm" in f["name"].lower():
+                instance_file = f["name"]
+                break
 
-        for ctx in self.soup.find_all("context"):
+        if not instance_file:
+            raise Exception("Instance file not found")
 
-            ctx_id = ctx.get("id")
-            if not ctx_id:
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{instance_file}"
+        r = requests.get(url, headers=HEADERS)
+        r.raise_for_status()
+
+        root = ET.fromstring(r.content)
+        context_map = {}
+
+        for context in root.findall(f".//{XBRL_NS}context"):
+            context_id = context.attrib["id"]
+            period = context.find(f"{XBRL_NS}period")
+            instant = period.find(f"{XBRL_NS}instant")
+            start = period.find(f"{XBRL_NS}startDate")
+            end = period.find(f"{XBRL_NS}endDate")
+
+            if instant is not None:
+                context_map[context_id] = instant.text
+            elif end is not None:
+                context_map[context_id] = end.text
+
+        facts = []
+        for elem in root.iter():
+            context_ref = elem.attrib.get("contextRef")
+            if context_ref not in context_map:
                 continue
 
-            # Skip dimensional contexts
-            if ctx.find("segment"):
-                continue
-
-            period = ctx.find("period")
-            if not period:
-                continue
-
-            instant = period.find("instant")
-            start = period.find("startDate")
-            end = period.find("endDate")
-
-            data = {"type": None, "start": None, "end": None, "instant": None}
-
-            if instant:
-                data["type"] = "instant"
-                data["instant"] = instant.text.strip()
-
-            elif start and end:
-                data["type"] = "duration"
-                data["start"] = start.text.strip()
-                data["end"] = end.text.strip()
-
-            self.context_map[ctx_id] = data
-
-    # ---------------------------------------------------------
-    # DETECT VALID FISCAL YEAR-END DATES FROM HEADER
-    # ---------------------------------------------------------
-
-    def detect_year_ends_from_table(self, table):
-
-        dates = set()
-
-        header_text = table.get_text(" ", strip=True)
-
-        # Look for June 27, 2025 etc
-        matches = re.findall(r"[A-Za-z]+\s+\d{1,2},\s+\d{4}", header_text)
-
-        for match in matches:
             try:
-                dt = datetime.strptime(match, "%B %d, %Y")
-                dates.add(dt.strftime("%Y-%m-%d"))
+                value = float(elem.text)
             except:
                 continue
 
-        return dates
+            # Extracts base concept name (e.g., 'Assets')
+            concept = elem.tag.split("}")[-1]
+
+            facts.append({
+                "concept": concept,
+                "date": context_map[context_ref],
+                "value": value
+            })
+
+        return pd.DataFrame(facts)
 
     # ---------------------------------------------------------
-    # FILTER FULL YEAR DURATION
+    # Parse presentation, normalize concepts, map to statements
     # ---------------------------------------------------------
+    def parse_presentation(self, cik, accession, files):
+        pre_file = self.find_file(files, "_pre.xml")
 
-    def is_full_year(self, context):
+        # Set up a 1-to-many relationship mapping
+        statements_concepts = {
+            "Balance Sheet": set(),
+            "Income Statement": set(),
+            "Cash Flow": set()
+        }
 
-        if context["type"] != "duration":
-            return False
+        if not pre_file:
+            return statements_concepts
 
-        try:
-            d1 = datetime.fromisoformat(context["start"])
-            d2 = datetime.fromisoformat(context["end"])
-            return (d2 - d1).days > 350
-        except:
-            return False
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{pre_file}"
+        r = requests.get(url, headers=HEADERS)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
 
-    # ---------------------------------------------------------
-    # FIND CONSOLIDATED TABLES
-    # ---------------------------------------------------------
+        for link in root.findall(f".//{LINK_NS}presentationLink"):
+            role_uri = link.attrib.get(f"{XLINK_NS}role", "").lower()
 
-    def find_statement_tables(self):
-
-        tables = []
-
-        headings = self.soup.find_all(
-            lambda tag: tag.name in ["p", "div", "strong", "h1", "h2", "h3"]
-            and tag.get_text(strip=True)
-        )
-
-        for heading in headings:
-
-            text = heading.get_text(strip=True).lower()
-
-            if any(t in text for t in self.TARGET_HEADINGS):
-
-                table = heading.find_next("table")
-
-                if table:
-                    tables.append((heading.get_text(strip=True), table))
-
-        return tables
-
-    # ---------------------------------------------------------
-    # CLEAN NUMERIC TAG
-    # ---------------------------------------------------------
-
-    def parse_numeric(self, tag):
-
-        if tag.get("format") == "ixt:fixed-zero":
-            return 0.0
-
-        text = tag.get_text(strip=True)
-        text = text.replace(",", "").replace("$", "").strip()
-
-        if text in ["—", "-", ""]:
-            return None
-
-        try:
-            value = float(text)
-        except:
-            return None
-
-        scale = int(tag.get("scale", "0"))
-        value *= 10 ** scale
-
-        if tag.get("sign") == "-":
-            value = -abs(value)
-
-        return value
-
-    # ---------------------------------------------------------
-    # PARSE TABLE WITH STRICT FILTERING
-    # ---------------------------------------------------------
-
-    def parse_table(self, table):
-
-        data = defaultdict(dict)
-
-        # detect valid fiscal year-ends
-        self.valid_year_ends = self.detect_year_ends_from_table(table)
-
-        for row in table.find_all("tr"):
-
-            cells = row.find_all(["td", "th"])
-            if not cells:
+            # Ignore disclosures, schedules, and parentheticals
+            if any(exclude in role_uri for exclude in ["disclosure", "parenthetical", "details", "policy"]):
                 continue
 
-            label = None
+            # Classify the statement
+            statement = None
+            if "balance" in role_uri or "financialposition" in role_uri:
+                statement = "Balance Sheet"
+            elif "income" in role_uri or "operations" in role_uri or "earnings" in role_uri:
+                statement = "Income Statement"
+            elif "cashflow" in role_uri or "cash" in role_uri:
+                statement = "Cash Flow"
 
-            # Extract first meaningful text as label
-            for cell in cells:
-                text = cell.get_text(strip=True)
-                if text and text not in ["$", "—", "-"]:
-                    label = text
-                    break
-
-            if not label:
+            if not statement:
                 continue
 
-            numeric_tags = row.find_all("ix:nonFraction")
-
-            if not numeric_tags:
-                continue
-
-            for tag in numeric_tags:
-
-                context_id = tag.get("contextRef")
-                context = self.context_map.get(context_id)
-
-                if not context:
+            # Extract concepts associated with this statement
+            for loc in link.findall(f".//{LINK_NS}loc"):
+                href = loc.attrib.get(f"{XLINK_NS}href")
+                if not href:
                     continue
 
-                # Determine date
-                if context["type"] == "instant":
-                    date = context["instant"]
-                else:
-                    if not self.is_full_year(context):
-                        continue
-                    date = context["end"]
+                # Example href: "aapl-20240928_htm.xml#us-gaap_Assets" -> "us-gaap_Assets"
+                anchor = href.split("#")[-1]
 
-                # Only keep dates that appear in header
-                if self.valid_year_ends and date not in self.valid_year_ends:
-                    continue
+                # Correct normalization: split by '_' instead of ':'
+                # Maxsplit=1 ensures things like 'us-gaap_Property_Plant_Equipment' become 'Property_Plant_Equipment'
+                concept = anchor.split("_", 1)[-1] if "_" in anchor else anchor
 
-                value = self.parse_numeric(tag)
-                if value is None:
-                    continue
+                statements_concepts[statement].add(concept)
 
-                data[label][date] = value
-
-        return data
+        return statements_concepts
 
     # ---------------------------------------------------------
-    # WRITE TO EXCEL
+    # Distribute facts dynamically to multiple statements
     # ---------------------------------------------------------
+    def distribute_statements(self, facts_df, statements_concepts):
+        statements = {}
 
-    def write_excel(self):
-
-        wb = Workbook()
-        wb.remove(wb.active)
-
-        used_names = set()
-
-        for title, table in self.find_statement_tables():
-
-            parsed = self.parse_table(table)
-
-            if not parsed:
+        for stmt_name, concepts in statements_concepts.items():
+            if not concepts:
                 continue
 
-            sheet_name = title[:31]
-            base = sheet_name
-            counter = 1
+            # Filter dataframe to only include concepts matching the current statement
+            subset = facts_df[facts_df["concept"].isin(concepts)]
 
-            while sheet_name in used_names:
-                sheet_name = f"{base[:28]}_{counter}"
-                counter += 1
+            if subset.empty:
+                continue
 
-            used_names.add(sheet_name)
-
-            ws = wb.create_sheet(sheet_name)
-
-            dates = sorted(
-                {d for row in parsed.values() for d in row.keys()}
+            # Pivot exactly like the All Facts sheet
+            pivot = subset.pivot_table(
+                index="concept",
+                columns="date",
+                values="value",
+                aggfunc="first"
             )
 
-            ws.cell(row=1, column=1, value="Line Item").font = Font(bold=True)
+            # Sort columns descending (newest dates on the left)
+            pivot = pivot.sort_index(axis=1, ascending=False)
+            statements[stmt_name] = pivot
 
-            for col, date in enumerate(dates, start=2):
-                ws.cell(row=1, column=col, value=date).font = Font(bold=True)
-
-            for r_idx, (label, values) in enumerate(parsed.items(), start=2):
-                ws.cell(row=r_idx, column=1, value=label)
-
-                for c_idx, date in enumerate(dates, start=2):
-                    if date in values:
-                        ws.cell(
-                            row=r_idx,
-                            column=c_idx,
-                            value=values[date]
-                        ).alignment = Alignment(horizontal="right")
-
-            ws.column_dimensions["A"].width = 55
-            for col in range(2, len(dates) + 2):
-                ws.column_dimensions[get_column_letter(col)].width = 18
-
-        wb.save(self.output_file)
+        return statements
 
     # ---------------------------------------------------------
-    # RUN
+    # Export Excel Architecture
     # ---------------------------------------------------------
+    def extract_excel_bytes(self, filing_url):
+        cik, accession = self.extract_ids_from_url(filing_url)
+        files = self.get_filing_index(cik, accession)
 
-    def run(self):
-        self.load()
-        self.build_context_map()
-        self.write_excel()
+        # 1. Get raw facts
+        facts_df = self.parse_instance(cik, accession, files)
+        
+        # 2. Get statement -> concepts map
+        statements_concepts = self.parse_presentation(cik, accession, files)
+        
+        # 3. Build statement dataframes
+        statements = self.distribute_statements(facts_df, statements_concepts)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            
+            # Write master 'All Facts' sheet
+            all_facts = facts_df.pivot_table(
+                index="concept",
+                columns="date",
+                values="value",
+                aggfunc="first"
+            )
+            all_facts = all_facts.sort_index(axis=1, ascending=False)
+            all_facts.to_excel(writer, sheet_name="All Facts")
+
+            # Write individual statements dynamically
+            for sheet_name in ["Balance Sheet", "Income Statement", "Cash Flow"]:
+                if sheet_name in statements:
+                    statements[sheet_name].to_excel(writer, sheet_name=sheet_name)
+
+        output.seek(0)
+        return output
 
 
-def parse_xbrl_to_excel(html_url, output_path):
+# ---------------------------------------------------------
+# Streamlit function hook
+# ---------------------------------------------------------
+def parse_xbrl_to_excel(filing_url, output_path=None):
+    parser = SECXBRLParser()
+    excel_bytes = parser.extract_excel_bytes(filing_url)
 
-    headers = {"User-Agent": "Research App contact@example.com"}
+    if output_path:
+        with open(output_path, "wb") as f:
+            f.write(excel_bytes.getvalue())
+        return True
 
-    response = requests.get(html_url, headers=headers, timeout=30)
-    response.raise_for_status()
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
-
-    parser = BulletProofConsolidatedParser(tmp_path, output_path)
-    parser.run()
-
-    Path(tmp_path).unlink()
-
-    return output_path
+    return excel_bytes

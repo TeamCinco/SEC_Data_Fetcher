@@ -11,6 +11,114 @@ XBRL_NS = "{http://www.xbrl.org/2003/instance}"
 LINK_NS = "{http://www.xbrl.org/2003/linkbase}"
 XLINK_NS = "{http://www.w3.org/1999/xlink}"
 
+# ---------------------------------------------------------
+# Role URI classification rules
+# ---------------------------------------------------------
+# Each statement has:
+#   - "include": keywords that MUST appear in the role URI
+#   - "exclude": keywords that disqualify the role even if include matches
+#
+# Order matters: more specific checks run first to avoid
+# "cash" in cash flow matching a cash disclosure role.
+# ---------------------------------------------------------
+
+STATEMENT_RULES = [
+    {
+        "name": "Balance Sheet",
+        "include": [
+            "balancesheet", "balance_sheet",
+            "financialposition", "financial_position",
+            "financialcondition", "financial_condition",
+            "consolidatedbalance", "statementoffinancialposition",
+        ],
+        "exclude": ["parenthetical", "detail", "policy", "note"],
+    },
+    {
+        "name": "Income Statement",
+        "include": [
+            "incomestatement", "income_statement",
+            "statementsofincome", "statementsofoperations",
+            "statementofincome", "statementofoperations",
+            "statementofearnings", "statementsofearnings",
+            "consolidatedoperations", "consolidatedincome",
+            "consolidatedearnings",
+            "profitandloss", "profit_and_loss",
+            "resultsofoperations",
+            "revenueexpense", "revenuecostsandexpenses",
+        ],
+        "exclude": ["parenthetical", "comprehensive", "detail", "policy", "note"],
+    },
+    {
+        "name": "Comprehensive Income",
+        "include": [
+            "comprehensiveincome", "comprehensive_income",
+            "othercomprehensive",
+        ],
+        "exclude": ["parenthetical", "detail", "policy", "note"],
+    },
+    {
+        "name": "Cash Flow",
+        "include": [
+            "cashflow", "cash_flow",
+            "statementofcashflows", "statementsofcashflows",
+            "consolidatedcashflows", "consolidatedstatementsofcash",
+        ],
+        "exclude": ["parenthetical", "detail", "policy", "note",
+                     "supplement", "disclosure"],
+    },
+    {
+        "name": "Stockholders Equity",
+        "include": [
+            "stockholdersequity", "stockholders_equity",
+            "shareholdersequity", "shareholders_equity",
+            "changesinequity", "changes_in_equity",
+            "statementofequity", "statementsofequity",
+        ],
+        "exclude": ["parenthetical", "detail", "policy", "note"],
+    },
+]
+
+
+def classify_role(role_uri):
+    """
+    Classify a presentation/calculation role URI into a statement name.
+    Returns the statement name or None if unclassified.
+    """
+    # Normalize: lowercase, strip spaces, collapse for keyword matching
+    normalized = role_uri.lower().replace(" ", "").replace("-", "")
+
+    for rule in STATEMENT_RULES:
+        # Check excludes first
+        if any(ex in normalized for ex in rule["exclude"]):
+            # But only skip if an include keyword also matches —
+            # otherwise this role wasn't going to match anyway
+            has_include = any(inc in normalized for inc in rule["include"])
+            if has_include:
+                continue  # Excluded: skip this rule
+            # No include match, so exclusion is irrelevant — fall through
+
+        # Check includes
+        if any(inc in normalized for inc in rule["include"]):
+            return rule["name"]
+
+    return None
+
+
+def extract_concept_from_href(href):
+    """
+    Extract the concept name from a linkbase loc href.
+    
+    Examples:
+        "aapl-20240928_htm.xml#us-gaap_Assets" -> "Assets"
+        "aapl-20240928_htm.xml#aapl_MacRevenue" -> "MacRevenue"
+        "aapl-20240928_htm.xml#us-gaap_PaymentsForRepurchaseOfCommonStock" 
+            -> "PaymentsForRepurchaseOfCommonStock"
+    """
+    anchor = href.split("#")[-1]
+    # Split on first underscore to strip namespace prefix (us-gaap_, aapl_, etc.)
+    # maxsplit=1 preserves underscores within the concept name itself
+    return anchor.split("_", 1)[-1] if "_" in anchor else anchor
+
 
 class SECXBRLParser:
 
@@ -31,7 +139,7 @@ class SECXBRLParser:
         return None
 
     # ---------------------------------------------------------
-    # Parse ALL facts with context dates
+    # Parse ALL facts with context dates (Consolidated Only)
     # ---------------------------------------------------------
     def parse_instance(self, cik, accession, files):
         instance_file = None
@@ -52,6 +160,11 @@ class SECXBRLParser:
         context_map = {}
 
         for context in root.findall(f".//{XBRL_NS}context"):
+            # Skip dimensional/segment contexts to get consolidated-only facts
+            entity = context.find(f"{XBRL_NS}entity")
+            if entity is not None and entity.find(f"{XBRL_NS}segment") is not None:
+                continue
+
             context_id = context.attrib["id"]
             period = context.find(f"{XBRL_NS}period")
             instant = period.find(f"{XBRL_NS}instant")
@@ -68,15 +181,12 @@ class SECXBRLParser:
             context_ref = elem.attrib.get("contextRef")
             if context_ref not in context_map:
                 continue
-
             try:
                 value = float(elem.text)
             except:
                 continue
 
-            # Extracts base concept name (e.g., 'Assets')
             concept = elem.tag.split("}")[-1]
-
             facts.append({
                 "concept": concept,
                 "date": context_map[context_ref],
@@ -86,17 +196,11 @@ class SECXBRLParser:
         return pd.DataFrame(facts)
 
     # ---------------------------------------------------------
-    # Parse presentation, normalize concepts, map to statements
+    # Parse presentation linkbase -> statement:concepts map
     # ---------------------------------------------------------
     def parse_presentation(self, cik, accession, files):
         pre_file = self.find_file(files, "_pre.xml")
-
-        # Set up a 1-to-many relationship mapping
-        statements_concepts = {
-            "Balance Sheet": set(),
-            "Income Statement": set(),
-            "Cash Flow": set()
-        }
+        statements_concepts = {}
 
         if not pre_file:
             return statements_concepts
@@ -107,43 +211,84 @@ class SECXBRLParser:
         root = ET.fromstring(r.content)
 
         for link in root.findall(f".//{LINK_NS}presentationLink"):
-            role_uri = link.attrib.get(f"{XLINK_NS}role", "").lower()
-
-            # Ignore disclosures, schedules, and parentheticals
-            if any(exclude in role_uri for exclude in ["disclosure", "parenthetical", "details", "policy"]):
-                continue
-
-            # Classify the statement
-            statement = None
-            if "balance" in role_uri or "financialposition" in role_uri:
-                statement = "Balance Sheet"
-            elif "income" in role_uri or "operations" in role_uri or "earnings" in role_uri:
-                statement = "Income Statement"
-            elif "cashflow" in role_uri or "cash" in role_uri:
-                statement = "Cash Flow"
-
+            role_uri = link.attrib.get(f"{XLINK_NS}role", "")
+            statement = classify_role(role_uri)
             if not statement:
                 continue
 
-            # Extract concepts associated with this statement
+            if statement not in statements_concepts:
+                statements_concepts[statement] = set()
+
             for loc in link.findall(f".//{LINK_NS}loc"):
-                href = loc.attrib.get(f"{XLINK_NS}href")
+                href = loc.attrib.get(f"{XLINK_NS}href", "")
                 if not href:
                     continue
-
-                # Example href: "aapl-20240928_htm.xml#us-gaap_Assets" -> "us-gaap_Assets"
-                anchor = href.split("#")[-1]
-
-                # Correct normalization: split by '_' instead of ':'
-                # Maxsplit=1 ensures things like 'us-gaap_Property_Plant_Equipment' become 'Property_Plant_Equipment'
-                concept = anchor.split("_", 1)[-1] if "_" in anchor else anchor
-
+                concept = extract_concept_from_href(href)
                 statements_concepts[statement].add(concept)
 
         return statements_concepts
 
     # ---------------------------------------------------------
-    # Distribute facts dynamically to multiple statements
+    # Parse calculation linkbase as secondary classifier
+    # ---------------------------------------------------------
+    def parse_calculation(self, cik, accession, files):
+        """
+        The calculation linkbase (_cal.xml) defines mathematical rollup
+        relationships (e.g., Assets = CurrentAssets + NoncurrentAssets).
+        Each calculationLink has a role URI that maps to a statement.
+        
+        This serves as a backup classifier — any concept found here
+        that wasn't in the presentation linkbase gets added.
+        """
+        cal_file = self.find_file(files, "_cal.xml")
+        statements_concepts = {}
+
+        if not cal_file:
+            return statements_concepts
+
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{cal_file}"
+        r = requests.get(url, headers=HEADERS)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+
+        for link in root.findall(f".//{LINK_NS}calculationLink"):
+            role_uri = link.attrib.get(f"{XLINK_NS}role", "")
+            statement = classify_role(role_uri)
+            if not statement:
+                continue
+
+            if statement not in statements_concepts:
+                statements_concepts[statement] = set()
+
+            for loc in link.findall(f".//{LINK_NS}loc"):
+                href = loc.attrib.get(f"{XLINK_NS}href", "")
+                if not href:
+                    continue
+                concept = extract_concept_from_href(href)
+                statements_concepts[statement].add(concept)
+
+        return statements_concepts
+
+    # ---------------------------------------------------------
+    # Merge presentation + calculation concept maps
+    # ---------------------------------------------------------
+    def merge_concept_maps(self, pre_map, cal_map):
+        """
+        Union of concepts from both linkbases per statement.
+        Presentation is the primary source; calculation fills gaps.
+        """
+        merged = {}
+        all_statements = set(list(pre_map.keys()) + list(cal_map.keys()))
+
+        for stmt in all_statements:
+            pre_concepts = pre_map.get(stmt, set())
+            cal_concepts = cal_map.get(stmt, set())
+            merged[stmt] = pre_concepts | cal_concepts
+
+        return merged
+
+    # ---------------------------------------------------------
+    # Distribute facts to statements
     # ---------------------------------------------------------
     def distribute_statements(self, facts_df, statements_concepts):
         statements = {}
@@ -152,46 +297,53 @@ class SECXBRLParser:
             if not concepts:
                 continue
 
-            # Filter dataframe to only include concepts matching the current statement
             subset = facts_df[facts_df["concept"].isin(concepts)]
-
             if subset.empty:
                 continue
 
-            # Pivot exactly like the All Facts sheet
             pivot = subset.pivot_table(
                 index="concept",
                 columns="date",
                 values="value",
                 aggfunc="first"
             )
-
-            # Sort columns descending (newest dates on the left)
             pivot = pivot.sort_index(axis=1, ascending=False)
             statements[stmt_name] = pivot
 
         return statements
 
     # ---------------------------------------------------------
-    # Export Excel Architecture
+    # Export Excel
     # ---------------------------------------------------------
     def extract_excel_bytes(self, filing_url):
         cik, accession = self.extract_ids_from_url(filing_url)
         files = self.get_filing_index(cik, accession)
 
-        # 1. Get raw facts
+        # 1. Get raw consolidated facts
         facts_df = self.parse_instance(cik, accession, files)
-        
-        # 2. Get statement -> concepts map
-        statements_concepts = self.parse_presentation(cik, accession, files)
-        
-        # 3. Build statement dataframes
+
+        # 2. Get statement -> concepts from BOTH linkbases
+        pre_map = self.parse_presentation(cik, accession, files)
+        cal_map = self.parse_calculation(cik, accession, files)
+        statements_concepts = self.merge_concept_maps(pre_map, cal_map)
+
+        # 3. Build statement DataFrames
         statements = self.distribute_statements(facts_df, statements_concepts)
 
+        # 4. Write Excel
         output = BytesIO()
+
+        # Define sheet order (only include sheets that have data)
+        sheet_order = [
+            "Balance Sheet",
+            "Income Statement",
+            "Comprehensive Income",
+            "Cash Flow",
+            "Stockholders Equity",
+        ]
+
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            
-            # Write master 'All Facts' sheet
+            # Master sheet with everything
             all_facts = facts_df.pivot_table(
                 index="concept",
                 columns="date",
@@ -201,8 +353,8 @@ class SECXBRLParser:
             all_facts = all_facts.sort_index(axis=1, ascending=False)
             all_facts.to_excel(writer, sheet_name="All Facts")
 
-            # Write individual statements dynamically
-            for sheet_name in ["Balance Sheet", "Income Statement", "Cash Flow"]:
+            # Individual statement sheets
+            for sheet_name in sheet_order:
                 if sheet_name in statements:
                     statements[sheet_name].to_excel(writer, sheet_name=sheet_name)
 

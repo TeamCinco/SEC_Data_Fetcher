@@ -10,7 +10,7 @@ HEADERS = {
 XBRL_NS = "{http://www.xbrl.org/2003/instance}"
 LINK_NS = "{http://www.xbrl.org/2003/linkbase}"
 XLINK_NS = "{http://www.w3.org/1999/xlink}"
-
+IXBRL_NS = "{http://www.xbrl.org/2013/inlineXBRL}" # recently added this line to deal with the change from xbrl to IXBRL in some filings
 # ---------------------------------------------------------
 # Role URI classification rules
 # ---------------------------------------------------------
@@ -141,6 +141,9 @@ class SECXBRLParser:
     # ---------------------------------------------------------
     # Parse ALL facts with context dates (Consolidated Only)
     # ---------------------------------------------------------
+# ---------------------------------------------------------
+    # Parse ALL facts with context dates (Consolidated Only)
+    # ---------------------------------------------------------
     def parse_instance(self, cik, accession, files):
         instance_file = None
 
@@ -159,6 +162,7 @@ class SECXBRLParser:
         root = ET.fromstring(r.content)
         context_map = {}
 
+        # 1. Parse Contexts (Works for both standard and iXBRL)
         for context in root.findall(f".//{XBRL_NS}context"):
             # Skip dimensional/segment contexts to get consolidated-only facts
             entity = context.find(f"{XBRL_NS}entity")
@@ -176,22 +180,48 @@ class SECXBRLParser:
             elif end is not None:
                 context_map[context_id] = end.text
 
+        # 2. Extract Facts
         facts = []
         for elem in root.iter():
             context_ref = elem.attrib.get("contextRef")
-            if context_ref not in context_map:
+            if not context_ref or context_ref not in context_map:
                 continue
+            
             try:
-                value = float(elem.text)
-            except:
+                # Handle Inline XBRL (iXBRL)
+                if elem.tag in [f"{IXBRL_NS}nonFraction", f"{IXBRL_NS}nonNumeric"]:
+                    raw_concept = elem.attrib.get("name", "")
+                    if not raw_concept:
+                        continue
+                        
+                    # Extract concept name (e.g., "us-gaap:Assets" -> "Assets")
+                    concept = raw_concept.split(":")[-1] if ":" in raw_concept else raw_concept
+                    
+                    # iXBRL uses a 'sign' attribute for negative numbers
+                    sign = -1 if elem.attrib.get("sign") == "-" else 1
+                    
+                    # Extract text, remove commas, handle empty strings
+                    text_val = "".join(elem.itertext()).strip().replace(",", "")
+                    if not text_val:
+                        continue
+                        
+                    value = float(text_val) * sign
+                
+                # Handle Standard XBRL
+                elif "}" in elem.tag and elem.tag.split("}")[0] + "}" not in [IXBRL_NS, LINK_NS, XLINK_NS]:
+                    concept = elem.tag.split("}")[-1]
+                    value = float(elem.text)
+                else:
+                    continue
+                    
+                facts.append({
+                    "concept": concept,
+                    "date": context_map[context_ref],
+                    "value": value
+                })
+            except Exception:
+                # Silently skip non-numeric strings or unparseable text
                 continue
-
-            concept = elem.tag.split("}")[-1]
-            facts.append({
-                "concept": concept,
-                "date": context_map[context_ref],
-                "value": value
-            })
 
         return pd.DataFrame(facts)
 
@@ -199,34 +229,93 @@ class SECXBRLParser:
     # Parse presentation linkbase -> statement:concepts map
     # ---------------------------------------------------------
     def parse_presentation(self, cik, accession, files):
+
         pre_file = self.find_file(files, "_pre.xml")
-        statements_concepts = {}
 
         if not pre_file:
-            return statements_concepts
+            return {}
 
         url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{pre_file}"
         r = requests.get(url, headers=HEADERS)
         r.raise_for_status()
+
         root = ET.fromstring(r.content)
 
+        statements = {}
+
         for link in root.findall(f".//{LINK_NS}presentationLink"):
+
             role_uri = link.attrib.get(f"{XLINK_NS}role", "")
-            statement = classify_role(role_uri)
-            if not statement:
+            statement_name = classify_role(role_uri)
+
+            if not statement_name:
                 continue
 
-            if statement not in statements_concepts:
-                statements_concepts[statement] = set()
+            label_map = {}
+            arcs = []
+            children = {}
 
-            for loc in link.findall(f".//{LINK_NS}loc"):
-                href = loc.attrib.get(f"{XLINK_NS}href", "")
-                if not href:
-                    continue
-                concept = extract_concept_from_href(href)
-                statements_concepts[statement].add(concept)
+            # build label map
+            for loc in link.findall(f"{LINK_NS}loc"):
 
-        return statements_concepts
+                label = loc.attrib.get(f"{XLINK_NS}label")
+                href = loc.attrib.get(f"{XLINK_NS}href")
+
+                if label and href:
+                    label_map[label] = extract_concept_from_href(href)
+
+            # build tree structure
+            for arc in link.findall(f"{LINK_NS}presentationArc"):
+
+                parent_label = arc.attrib.get(f"{XLINK_NS}from")
+                child_label = arc.attrib.get(f"{XLINK_NS}to")
+
+                order = float(arc.attrib.get("order", "0"))
+
+                parent = label_map.get(parent_label)
+                child = label_map.get(child_label)
+
+                if parent and child:
+
+                    if parent not in children:
+                        children[parent] = []
+
+                    children[parent].append({
+                        "concept": child,
+                        "order": order,
+                        "parent": parent
+                    })
+
+            # recursive traversal
+            ordered = []
+
+            def walk(parent):
+
+                if parent not in children:
+                    return
+
+                nodes = sorted(children[parent], key=lambda x: x["order"])
+
+                for node in nodes:
+
+                    ordered.append(node)
+
+                    walk(node["concept"])
+
+            # find root nodes
+            all_children = set()
+            for v in children.values():
+                for node in v:
+                    all_children.add(node["concept"])
+
+            roots = [p for p in children.keys() if p not in all_children]
+
+            for root_node in roots:
+                walk(root_node)
+
+            statements[statement_name] = ordered
+
+        return statements
 
     # ---------------------------------------------------------
     # Parse calculation linkbase as secondary classifier
@@ -273,31 +362,54 @@ class SECXBRLParser:
     # Merge presentation + calculation concept maps
     # ---------------------------------------------------------
     def merge_concept_maps(self, pre_map, cal_map):
-        """
-        Union of concepts from both linkbases per statement.
-        Presentation is the primary source; calculation fills gaps.
-        """
+
         merged = {}
-        all_statements = set(list(pre_map.keys()) + list(cal_map.keys()))
+
+        all_statements = set(pre_map.keys()).union(cal_map.keys())
 
         for stmt in all_statements:
-            pre_concepts = pre_map.get(stmt, set())
+
+            pre_arcs = pre_map.get(stmt, [])
             cal_concepts = cal_map.get(stmt, set())
-            merged[stmt] = pre_concepts | cal_concepts
+
+            # extract concepts already in presentation
+            pre_concept_names = set()
+
+            for arc in pre_arcs:
+                pre_concept_names.add(arc["concept"])
+
+            # add missing concepts from calculation linkbase
+            order_counter = len(pre_arcs) + 1
+
+            for concept in cal_concepts:
+
+                if concept not in pre_concept_names:
+
+                    pre_arcs.append({
+                        "concept": concept,
+                        "parent": None,
+                        "order": order_counter
+                    })
+
+                    order_counter += 1
+
+            merged[stmt] = pre_arcs
 
         return merged
 
     # ---------------------------------------------------------
     # Distribute facts to statements
     # ---------------------------------------------------------
-    def distribute_statements(self, facts_df, statements_concepts):
+    def distribute_statements(self, facts_df, statements_structure):
+
         statements = {}
 
-        for stmt_name, concepts in statements_concepts.items():
-            if not concepts:
-                continue
+        for stmt_name, arcs in statements_structure.items():
 
-            subset = facts_df[facts_df["concept"].isin(concepts)]
+            ordered_concepts = [arc["concept"] for arc in arcs]
+
+            subset = facts_df[facts_df["concept"].isin(ordered_concepts)]
+
             if subset.empty:
                 continue
 
@@ -307,11 +419,16 @@ class SECXBRLParser:
                 values="value",
                 aggfunc="first"
             )
+
+            existing = [c for c in ordered_concepts if c in pivot.index]
+
+            pivot = pivot.reindex(existing)
+
             pivot = pivot.sort_index(axis=1, ascending=False)
+
             statements[stmt_name] = pivot
 
         return statements
-
     # ---------------------------------------------------------
     # Export Excel
     # ---------------------------------------------------------

@@ -448,7 +448,8 @@ class SECXBRLParser:
 
         return {
             "facts": facts_df,
-            "statements": statements
+            "statements": statements,
+            "structure": statements_concepts
         }
 
 

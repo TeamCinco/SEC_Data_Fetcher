@@ -167,7 +167,7 @@ def render_filing_row(row):
                     if st.button("🔧 Generate Excel (Backup)", use_container_width=True, key=backup_button_key, help="Use if SEC download fails"):
                         with st.spinner("Parsing XBRL and generating Excel..."):
                             try:
-                                from xbrl_parser import parse_xbrl_to_excel
+                                from excel_generator import generate_excel_from_filing                                
                                 import tempfile
                                 import os
                                 
@@ -177,7 +177,7 @@ def render_filing_row(row):
                                 output_file.close()
                                 
                                 # Parse XBRL to Excel
-                                result = parse_xbrl_to_excel(row['filing_url'], output_path)
+                                result = generate_excel_from_filing(row['filing_url'], output_path)
                                 
                                 if result:
                                     # Read the file

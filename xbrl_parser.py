@@ -430,65 +430,25 @@ class SECXBRLParser:
 
         return statements
     # ---------------------------------------------------------
-    # Export Excel
+    # Export data frame NOT AN EXCEL....
     # ---------------------------------------------------------
-    def extract_excel_bytes(self, filing_url):
+    def extract_statements(self, filing_url):
+
         cik, accession = self.extract_ids_from_url(filing_url)
         files = self.get_filing_index(cik, accession)
 
-        # 1. Get raw consolidated facts
         facts_df = self.parse_instance(cik, accession, files)
 
-        # 2. Get statement -> concepts from BOTH linkbases
         pre_map = self.parse_presentation(cik, accession, files)
         cal_map = self.parse_calculation(cik, accession, files)
+
         statements_concepts = self.merge_concept_maps(pre_map, cal_map)
 
-        # 3. Build statement DataFrames
         statements = self.distribute_statements(facts_df, statements_concepts)
 
-        # 4. Write Excel
-        output = BytesIO()
-
-        # Define sheet order (only include sheets that have data)
-        sheet_order = [
-            "Balance Sheet",
-            "Income Statement",
-            "Comprehensive Income",
-            "Cash Flow",
-            "Stockholders Equity",
-        ]
-
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            # Master sheet with everything
-            all_facts = facts_df.pivot_table(
-                index="concept",
-                columns="date",
-                values="value",
-                aggfunc="first"
-            )
-            all_facts = all_facts.sort_index(axis=1, ascending=False)
-            all_facts.to_excel(writer, sheet_name="All Facts")
-
-            # Individual statement sheets
-            for sheet_name in sheet_order:
-                if sheet_name in statements:
-                    statements[sheet_name].to_excel(writer, sheet_name=sheet_name)
-
-        output.seek(0)
-        return output
+        return {
+            "facts": facts_df,
+            "statements": statements
+        }
 
 
-# ---------------------------------------------------------
-# Streamlit function hook
-# ---------------------------------------------------------
-def parse_xbrl_to_excel(filing_url, output_path=None):
-    parser = SECXBRLParser()
-    excel_bytes = parser.extract_excel_bytes(filing_url)
-
-    if output_path:
-        with open(output_path, "wb") as f:
-            f.write(excel_bytes.getvalue())
-        return True
-
-    return excel_bytes

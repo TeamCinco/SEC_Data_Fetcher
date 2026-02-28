@@ -1,138 +1,175 @@
 import pandas as pd
-from io import BytesIO
-from openpyxl.styles import Font, Alignment, PatternFill, NamedStyle
+import re
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import FormulaRule
 
 
 class ExcelExporter:
+    """Formats parsed XBRL data into styled Excel sheets.
+    Model scaffolding (Cover, Assumptions, DCF) lives in excel_generator."""
 
-    def export(self, financials):
+    PROJECTION_YEARS = 5
 
+    HEADER_FILL = PatternFill("solid", fgColor="E7EEF7")
+    YEAR_LABEL_FILL = PatternFill("solid", fgColor="D6E4F0")
+    ZEBRA_FILL = PatternFill("solid", fgColor="F7F9FC")
+    SUBTOTAL_FILL = PatternFill("solid", fgColor="E2EFDA")
+    PROJ_HEADER_FILL = PatternFill("solid", fgColor="D6E4F0")
+
+    CURRENCY_FMT = '#,##0;(#,##0);"-"'
+    THIN_BORDER_BTM = Border(bottom=Side("thin", color="B0B0B0"))
+    THIN_BORDER_TOP = Border(top=Side("thin", color="808080"))
+
+    TOTAL_KEYWORDS = {
+        "total", "net income", "net loss", "gross profit",
+        "operating income", "ebit", "ebitda",
+        "income before", "loss before", "net revenue",
+    }
+
+    # ── Public ──
+
+    def write_data_sheets(self, financials, writer):
+        """Write All Facts + statement sheets into an open pd.ExcelWriter."""
         facts = financials["facts"]
         statements = financials["statements"]
 
-        output = BytesIO()
+        pivot = facts.pivot_table(index="concept", columns="date", values="value", aggfunc="first")
+        pivot = self._sort_cols(pivot)
+        pivot.to_excel(writer, sheet_name="All Facts")
+        self._beautify(writer.book["All Facts"], year_labels=True, projections=False)
 
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in statements.items():
+            clean = df.copy()
+            if "level" in clean.columns and "label" in clean.columns:
+                clean["label"] = clean.apply(
+                    lambda r: "    " * int(r["level"]) + str(r["label"]), axis=1
+                )
+            clean = self._sort_df_cols(clean)
+            clean.to_excel(writer, sheet_name=name)
+            self._beautify(writer.book[name], year_labels=True, projections=True)
 
-            # -------- All Facts Sheet --------
+    def count_date_columns(self, statements):
+        for _, df in statements.items():
+            n = sum(1 for c in df.columns if self._is_date(c))
+            if n > 0:
+                return n
+        return 3
 
-            facts_pivot = facts.pivot_table(
-                index="concept",
-                columns="date",
-                values="value",
-                aggfunc="first"
-            )
+    # ── Column helpers ──
 
-            facts_pivot.to_excel(writer, sheet_name="All Facts")
+    def _sort_key(self, col):
+        s = str(col)
+        m = re.match(r'[Yy]ear\s*([+-]?\d+)', s)
+        if m:
+            return (0, int(m.group(1)), s)
+        try:
+            return (1, pd.Timestamp(s).timestamp(), s)
+        except (ValueError, TypeError):
+            pass
+        if re.match(r'^\d{4}$', s):
+            return (1, int(s), s)
+        return (2, 0, s)
 
-            ws = writer.book["All Facts"]
-            self._beautify_sheet(ws, facts_pivot)
+    def _is_date(self, col):
+        s = str(col)
+        if re.match(r'[Yy]ear\s*[+-]?\d+', s):
+            return True
+        try:
+            pd.Timestamp(s)
+            return True
+        except (ValueError, TypeError):
+            return bool(re.match(r'^\d{4}$', s))
 
+    def _sort_cols(self, pivot):
+        return pivot[sorted(pivot.columns, key=self._sort_key)]
 
-            # -------- Statements --------
+    def _sort_df_cols(self, df):
+        meta = [c for c in df.columns if not self._is_date(c)]
+        dates = sorted([c for c in df.columns if self._is_date(c)], key=self._sort_key)
+        return df[meta + dates]
 
-            for name, df in statements.items():
+    # ── Formatting engine ──
 
-                df_clean = df.copy()
-
-                # Optional: indent hierarchy if level column exists
-                if "level" in df_clean.columns and "label" in df_clean.columns:
-                    df_clean["label"] = df_clean.apply(
-                        lambda row: "    " * int(row["level"]) + str(row["label"]),
-                        axis=1
-                    )
-
-                df_clean.to_excel(writer, sheet_name=name)
-
-                ws = writer.book[name]
-                self._beautify_sheet(ws, df_clean)
-
-
-        output.seek(0)
-        return output
-
-
-    # ---------- Formatting Engine ----------
-
-    def _beautify_sheet(self, ws, df):
-
-        header_font = Font(bold=True, size=12)
+    def _beautify(self, ws, year_labels=False, projections=False):
+        hdr_font = Font(bold=True, size=12)
         data_font = Font(size=11)
+        bold_font = Font(bold=True, size=11)
+        yr_font = Font(size=10, bold=True, color="4472C4")
+        center = Alignment(horizontal="center", vertical="center")
+        left = Alignment(horizontal="left", vertical="center")
 
-        header_fill = PatternFill(
-            start_color="E7EEF7",
-            end_color="E7EEF7",
-            fill_type="solid"
-        )
+        max_row, max_col = ws.max_row, ws.max_column
 
-        zebra_fill = PatternFill(
-            start_color="F7F9FC",
-            end_color="F7F9FC",
-            fill_type="solid"
-        )
+        date_hdrs = [
+            (c, str(ws.cell(row=1, column=c).value or ""))
+            for c in range(1, max_col + 1)
+            if self._is_date(str(ws.cell(row=1, column=c).value or ""))
+        ]
+        num_hist = len(date_hdrs)
 
-        currency_format = '#,##0;[Red]-#,##0'
-        currency_format_2 = '#,##0.00;[Red]-#,##0.00'
+        # Year label row (inserted above headers)
+        if year_labels and date_hdrs:
+            ws.insert_rows(1)
+            max_row += 1
+            for i, (col, _) in enumerate(date_hdrs):
+                cell = ws.cell(row=1, column=col, value=f"Year {i - (num_hist - 1)}")
+                cell.font, cell.fill, cell.alignment = yr_font, self.YEAR_LABEL_FILL, center
+            hdr_row, data_row = 2, 3
+        else:
+            hdr_row, data_row = 1, 2
 
-        center_align = Alignment(vertical="center")
-        left_align = Alignment(horizontal="left", vertical="center")
+        # Header styling
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=hdr_row, column=c)
+            cell.font, cell.fill, cell.alignment = hdr_font, self.HEADER_FILL, center
 
-        max_row = ws.max_row
-        max_col = ws.max_column
+        # Data rows
+        for r in range(data_row, max_row + 1):
+            lbl = str(ws.cell(row=r, column=1).value or "").strip().lower()
+            total = any(kw in lbl for kw in self.TOTAL_KEYWORDS)
 
-        # ----- Header styling -----
+            for c in range(1, max_col + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.font = bold_font if total else data_font
+                if total:
+                    cell.border = self.THIN_BORDER_TOP
+                cell.alignment = left if c == 1 else center
+                if c > 1:
+                    cell.number_format = self.CURRENCY_FMT
 
-        for col in range(1, max_col + 1):
+            fill = self.SUBTOTAL_FILL if total else (self.ZEBRA_FILL if r % 2 == 0 else None)
+            if fill:
+                for c in range(1, max_col + 1):
+                    ws.cell(row=r, column=c).fill = fill
 
-            cell = ws.cell(row=1, column=col)
+        # Projection columns
+        if projections and date_hdrs:
+            last_yr = None
+            for _, h in reversed(date_hdrs):
+                m = re.search(r'(\d{4})', h)
+                if m:
+                    last_yr = int(m.group(1))
+                    break
+            if last_yr:
+                for i in range(1, self.PROJECTION_YEARS + 1):
+                    pc = max_col + i
+                    if year_labels:
+                        cell = ws.cell(row=1, column=pc, value=f"Year {i}")
+                        cell.font, cell.fill, cell.alignment = yr_font, self.YEAR_LABEL_FILL, center
+                    cell = ws.cell(row=hdr_row, column=pc, value=f"{last_yr + i}E")
+                    cell.font = Font(bold=True, size=12, color="1F4E79")
+                    cell.fill, cell.alignment = self.PROJ_HEADER_FILL, center
+                    for r in range(data_row, max_row + 1):
+                        cell = ws.cell(row=r, column=pc)
+                        cell.number_format = self.CURRENCY_FMT
+                        cell.alignment = center
+                        cell.border = self.THIN_BORDER_BTM
+                    ws.column_dimensions[get_column_letter(pc)].width = 18
 
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = center_align
+        # Auto-width + freeze
+        for c in range(1, ws.max_column + 1):
+            mx = max((len(str(ws.cell(row=r, column=c).value or ""))
+                       for r in range(1, ws.max_row + 1)), default=8)
+            ws.column_dimensions[get_column_letter(c)].width = min(mx + 4, 50)
 
-
-        # ----- Data styling -----
-
-        for row in range(2, max_row + 1):
-
-            for col in range(1, max_col + 1):
-
-                cell = ws.cell(row=row, column=col)
-
-                cell.font = data_font
-
-                if col == 1:
-                    cell.alignment = left_align
-                else:
-                    cell.number_format = currency_format
-                    cell.alignment = center_align
-
-            # zebra striping
-            if row % 2 == 0:
-                for col in range(1, max_col + 1):
-                    ws.cell(row=row, column=col).fill = zebra_fill
-
-
-        # ----- Auto column width -----
-
-        for col in range(1, max_col + 1):
-
-            max_length = 0
-
-            col_letter = get_column_letter(col)
-
-            for row in range(1, max_row + 1):
-
-                value = ws.cell(row=row, column=col).value
-
-                if value:
-                    max_length = max(max_length, len(str(value)))
-
-            ws.column_dimensions[col_letter].width = min(max_length + 4, 50)
-
-
-        # ----- Freeze header -----
-
-        ws.freeze_panes = "B2"
+        ws.freeze_panes = "B3" if year_labels else "B2"

@@ -1,3 +1,16 @@
+## Why Not Just Use the SEC API?
+
+While the U.S. Securities and Exchange Commission provides APIs that expose financial facts, those endpoints return **aggregated concept value pairs across filings**. They do not reconstruct full financial statements or preserve the structure defined in the filing itself.
+
+This project instead parses the **actual filing from EDGAR** and rebuilds the statements directly from the Inline XBRL data. By using the filing itself as the source of truth, the tool can:
+
+* Extract financial statements exactly as reported in the filing
+* Preserve statement structure using XBRL presentation and calculation relationships
+* Avoid issues where aggregated APIs return multiple values for the same period after restatements
+* Work immediately when a filing is released, without waiting for the SEC to generate its interactive Excel version
+
+In short, the SEC APIs are excellent for **retrieving standardized facts at scale**, while this project focuses on **reconstructing structured financial statements directly from the filing source**.
+
 # SEC Filing Downloader & Financial Parser
 
 A real-time tool to download SEC filings (10-K/10-Q) and instantly convert them into structured Excel files—even when the official SEC Excel version isn't available yet.
